@@ -73,6 +73,12 @@ UNIQUE_COLUMNS = [
     "tipodocumento", "id_documento", "currenttimemillis",
 ]
 
+# tipodocumento de ENTRADA no Unico (NF-e 55 e CT-e/57). Essas linhas são
+# reconciliadas por documento (tipodocumento + id_documento) em vez de upsert por
+# linha, para eliminar órfãos de reedição. Vendas Unico (tipodoc 1) e entradas
+# antigas sem id_documento (migradas antes do campo existir) seguem por upsert.
+ENTRADA_TIPODOCS_UNICO = {2, 3}
+
 logger = setup_logger("audit_movimentacao_estoque", log_file="logs/audit_movimentacao_estoque.log")
 
 
@@ -584,10 +590,13 @@ def _transform_unico(df: pd.DataFrame) -> pd.DataFrame:
     return clean_dataframe_nans(df[existing])
 
 
-def sync_unico(dates: list, unico_pg: DatabaseConnection, mercado: DatabaseConnection) -> dict:
-    _section("Sync — Unico (dados históricos pré 01/04/2026)")
+def sync_unico(dates: list, unico_pg: DatabaseConnection, mercado: DatabaseConnection,
+               dry_run: bool = False) -> dict:
+    modo = " [DRY-RUN — nada será persistido]" if dry_run else ""
+    _section(f"Sync — Unico (dados históricos pré 01/04/2026){modo}")
     query = load_query_from_file("movimentacao_estoque_unico.sql")
     processed, failed = [], []
+    tot_del = tot_ins = 0
 
     for d in dates:
         try:
@@ -597,19 +606,48 @@ def sync_unico(dates: list, unico_pg: DatabaseConnection, mercado: DatabaseConne
                 _warn(f"  Nenhum dado no Unico para {d}.")
                 continue
             df = _transform_unico(df_raw)
-            mercado.upsert(
-                table_name="movimentacao_estoque",
-                data=df,
-                unique_columns=UNIQUE_COLUMNS,
-                schema="public",
-            )
-            _ok(f"  {len(df)} registros upserted para {d}.")
+
+            # Entradas Unico com id_documento -> reconciliação por documento;
+            # restante (vendas tipodoc 1 e entradas antigas sem id_documento) -> upsert.
+            is_entrada = df["tipodocumento"].isin(ENTRADA_TIPODOCS_UNICO) & df["id_documento"].notna()
+            df_entradas = df[is_entrada]
+            df_resto = df[~is_entrada]
+
+            if not df_entradas.empty:
+                res = mercado.reconcile_by_document(
+                    table_name="movimentacao_estoque",
+                    data=df_entradas,
+                    doc_columns=["tipodocumento", "id_documento"],
+                    schema="public",
+                    dry_run=dry_run,
+                )
+                tot_del += res["linhas_deletadas"]
+                tot_ins += res["linhas_inseridas"]
+
+            # No dry-run NÃO mexemos em vendas/resto (upsert persiste) — apenas validamos entradas.
+            if not df_resto.empty and not dry_run:
+                mercado.upsert(
+                    table_name="movimentacao_estoque",
+                    data=df_resto,
+                    unique_columns=UNIQUE_COLUMNS,
+                    schema="public",
+                )
+
+            if dry_run:
+                _ok(f"  [DRY-RUN] {len(df_entradas)} entradas (deletaria {res['linhas_deletadas'] if not df_entradas.empty else 0}, "
+                    f"reinseriria {res['linhas_inseridas'] if not df_entradas.empty else 0}); "
+                    f"{len(df_resto)} de venda/resto IGNORADOS (não tocados).")
+            else:
+                _ok(f"  {len(df_entradas)} entradas reconciliadas + {len(df_resto)} via upsert para {d}.")
             processed.append(d)
         except Exception as e:
             logger.error(f"Erro ao processar {d} (Unico): {e}")
             _warn(f"  FALHOU: {e}")
             failed.append({"date": d, "error": str(e)})
 
+    if dry_run:
+        _info(f"\n[DRY-RUN] TOTAL: deletaria {tot_del}, reinseriria {tot_ins} linhas de ENTRADA. "
+              f"Vendas intocadas. Nenhum TRUNCATE. Nada persistido (ROLLBACK).")
     return {"processed": processed, "failed": failed}
 
 
@@ -617,15 +655,16 @@ def sync_unico(dates: list, unico_pg: DatabaseConnection, mercado: DatabaseConne
 # Sync — G3
 # ---------------------------------------------------------------------------
 
-def sync_g3(dates: list) -> dict:
-    _section("Sync — G3 (dados a partir de 01/04/2026)")
+def sync_g3(dates: list, dry_run: bool = False) -> dict:
+    modo = " [DRY-RUN — nada será persistido]" if dry_run else ""
+    _section(f"Sync — G3 (dados a partir de 01/04/2026){modo}")
     etl = MovimentacaoEstoqueETL(source_config=G3_DATABASE, target_config=BANCO_MERCADO)
     processed, failed = [], []
 
     for d in dates:
         try:
-            _info(f"Processando {d} (G3)...")
-            etl._process_single_date(d)
+            _info(f"Processando {d} (G3){' [DRY-RUN]' if dry_run else ''}...")
+            etl._process_single_date(d, dry_run=dry_run)
             _ok(f"  Concluído para {d}.")
             processed.append(d)
         except Exception as e:
@@ -636,14 +675,102 @@ def sync_g3(dates: list) -> dict:
     return {"processed": processed, "failed": failed}
 
 
+def fix_entradas_g3(g3: DatabaseConnection, dry_run: bool = False) -> dict:
+    """Reprocessa TODAS as datas de entrada do G3 reconciliando entradas por documento
+    (notas_entrada.id). Limpa órfãos de reedição (nep.id regenerado). Vendas seguem upsert.
+    Com dry_run=True nada é persistido (reconcile em transação com ROLLBACK; vendas ignoradas)."""
+    _section("Fix — Reconciliar entradas G3 por documento (todas as datas de entrada)")
+
+    q = """
+        SELECT DISTINCT COALESCE(data_chegada, data_emissao) AS data
+        FROM notas_entrada
+        WHERE COALESCE(data_chegada, data_emissao) >= '2026-04-01'
+        ORDER BY 1;
+    """
+    df = g3.get_data(q)
+    if df.empty:
+        _warn("Nenhuma data de entrada G3 encontrada.")
+        return {"processed": [], "failed": []}
+
+    dates = [str(x) for x in df["data"].tolist()]
+    _info(f"{len(dates)} datas de entrada G3 a reprocessar{' (DRY-RUN)' if dry_run else ''}.")
+    return sync_g3(dates, dry_run=dry_run)
+
+
 # ---------------------------------------------------------------------------
 # Fix id_documento — reprocessa todas as datas Unico
 # ---------------------------------------------------------------------------
 
-def fix_id_documento_unico(unico_pg: DatabaseConnection, mercado: DatabaseConnection) -> dict:
-    """Reprocessa todas as datas Unico via UPSERT para corrigir id_documento
-    (m.idoriginal = operacao.id, não m.id = linha de movimentação)."""
-    _section("Fix — Corrigir id_documento de todos os registros Unico")
+def fix_orfaos_unico(unico_pg: DatabaseConnection, mercado: DatabaseConnection,
+                     dry_run: bool = False) -> dict:
+    """Remove do destino as linhas de ENTRADA Unico (tipodoc 2,3) cujo par
+    (tipodocumento, currenttimemillis) não existe mais na origem (movimentoestoque,
+    cancelado=0). São órfãos legados (em geral pré-2021, sem id_documento) que o
+    reconcile-by-document não alcança. NÃO usa TRUNCATE; DELETE escopado aos pares órfãos.
+    Trava de segurança: aborta se a origem retornar um conjunto suspeitosamente pequeno."""
+    from psycopg2.extras import execute_values
+    _section(f"Fix — Remover órfãos legados Unico (entradas){' [DRY-RUN]' if dry_run else ''}")
+
+    # 1) Pares (tipodoc, ctm) vigentes na ORIGEM
+    df_src = unico_pg.get_data("""
+        SELECT DISTINCT tipodocumento, currenttimemillis
+        FROM public.movimentoestoque
+        WHERE tipodocumento IN (2,3) AND cancelado = 0 AND currenttimemillis IS NOT NULL
+    """)
+    src_pairs = {(int(t), int(c)) for t, c in df_src.itertuples(index=False)}
+    _info(f"Pares (tipodoc,ctm) vigentes na origem: {len(src_pairs)}")
+
+    # TRAVA DE SEGURANÇA: origem precisa ser substancial (esperado ~135k)
+    if len(src_pairs) < 50000:
+        _warn(f"ABORTADO: origem retornou apenas {len(src_pairs)} pares — suspeito de falha. "
+              f"Nenhum DELETE executado.")
+        return {"orfaos": 0, "deletadas": 0, "abortado": True}
+
+    # 2) Pares no DESTINO (entradas) e identificação dos órfãos
+    df_dst = mercado.get_data("""
+        SELECT tipodocumento, currenttimemillis, COUNT(*) AS n
+        FROM movimentacao_estoque
+        WHERE tipodocumento IN (2,3) AND currenttimemillis IS NOT NULL
+        GROUP BY tipodocumento, currenttimemillis
+    """)
+    orfaos = [(int(t), int(c)) for t, c, n in df_dst.itertuples(index=False) if (int(t), int(c)) not in src_pairs]
+    linhas_orfas = int(sum(n for t, c, n in df_dst.itertuples(index=False) if (int(t), int(c)) not in src_pairs))
+    _info(f"Pares órfãos no destino (ctm sumiu da origem): {len(orfaos)} ({linhas_orfas} linhas)")
+
+    if not orfaos:
+        _ok("Nenhum órfão a remover.")
+        return {"orfaos": 0, "deletadas": 0, "abortado": False}
+
+    del_q = ("DELETE FROM public.movimentacao_estoque t USING (VALUES %s) AS v(tipodocumento, currenttimemillis) "
+             "WHERE t.tipodocumento = v.tipodocumento AND t.currenttimemillis = v.currenttimemillis")
+    deleted = 0
+    mercado.connect()
+    try:
+        with mercado.connection.cursor() as cur:
+            for i in range(0, len(orfaos), 500):
+                execute_values(cur, del_q, orfaos[i:i+500], page_size=500)
+                deleted += cur.rowcount
+        if dry_run:
+            mercado.connection.rollback()
+            _info(f"[DRY-RUN] {deleted} linhas órfãs SERIAM removidas — ROLLBACK (nada persistido).")
+        else:
+            mercado.connection.commit()
+            _ok(f"{deleted} linhas órfãs removidas.")
+    except Exception as e:
+        mercado.connection.rollback()
+        logger.error(f"Erro no delete de órfãos Unico: {e}")
+        raise
+    finally:
+        mercado.disconnect()
+
+    return {"orfaos": len(orfaos), "deletadas": deleted, "abortado": False}
+
+
+def fix_id_documento_unico(unico_pg: DatabaseConnection, mercado: DatabaseConnection,
+                           dry_run: bool = False) -> dict:
+    """Reprocessa todas as datas Unico para reconciliar as ENTRADAS por documento
+    (m.idoriginal = operacao.id). Com dry_run=True nada é persistido."""
+    _section("Fix — Reconciliar entradas Unico por documento (todas as datas)")
 
     q = """
         SELECT DISTINCT DATE(datahora) AS data
@@ -657,8 +784,8 @@ def fix_id_documento_unico(unico_pg: DatabaseConnection, mercado: DatabaseConnec
         return {"processed": [], "failed": []}
 
     dates = df["data"].astype(str).tolist()
-    _info(f"{len(dates)} datas Unico a reprocessar.")
-    return sync_unico(dates, unico_pg, mercado)
+    _info(f"{len(dates)} datas Unico a reprocessar{' (DRY-RUN)' if dry_run else ''}.")
+    return sync_unico(dates, unico_pg, mercado, dry_run=dry_run)
 
 
 # ---------------------------------------------------------------------------
@@ -734,11 +861,17 @@ def main() -> None:
     parser.add_argument("--audit", action="store_true",
                         help="Apenas audita e exibe relatório sem modificar dados.")
     parser.add_argument("--fix-id-documento", action="store_true", dest="fix_id_documento",
-                        help="Reprocessa todas as datas Unico para corrigir id_documento.")
+                        help="Reprocessa todas as datas Unico para reconciliar entradas por documento.")
+    parser.add_argument("--dry-run", action="store_true", dest="dry_run",
+                        help="Simula a reconciliação (DELETE+INSERT em transação com ROLLBACK); não persiste nada.")
     parser.add_argument("--fix-chave-nfe-g3", action="store_true", dest="fix_chave_nfe_g3",
                         help="Reprocessa todas as datas G3 para popular chave_nfe.")
+    parser.add_argument("--fix-entradas-g3", action="store_true", dest="fix_entradas_g3",
+                        help="Reconcilia entradas G3 por documento em todas as datas de entrada (limpa órfãos).")
     parser.add_argument("--fix-chave-nfe-unico", action="store_true", dest="fix_chave_nfe_unico",
                         help="Reprocessa só as datas Unico com entradas sem chave_nfe.")
+    parser.add_argument("--fix-orfaos-unico", action="store_true", dest="fix_orfaos_unico",
+                        help="Remove órfãos legados Unico (entradas cujo ctm sumiu da origem).")
     args = parser.parse_args()
 
     mercado = _mercado_conn()
@@ -746,8 +879,9 @@ def main() -> None:
     g3 = _g3_conn()
 
     if args.fix_id_documento:
-        _info("Modo: FIX id_documento (reprocessa todas as datas Unico)")
-        r = fix_id_documento_unico(unico_pg, mercado)
+        modo = "DRY-RUN (nada persistido)" if args.dry_run else "APLICANDO"
+        _info(f"Modo: FIX reconciliar entradas Unico por documento — {modo}")
+        r = fix_id_documento_unico(unico_pg, mercado, dry_run=args.dry_run)
         _print_summary({"datas_reprocessadas": len(r["processed"]), "datas_falhou": len(r["failed"]), **({} if not r["failed"] else {"falhas": r["failed"]})})
         return
 
@@ -757,9 +891,23 @@ def main() -> None:
         _print_summary({"datas_reprocessadas": len(r["processed"]), "datas_falhou": len(r["failed"]), **({} if not r["failed"] else {"falhas": r["failed"]})})
         return
 
+    if args.fix_orfaos_unico:
+        modo = "DRY-RUN (nada persistido)" if args.dry_run else "APLICANDO"
+        _info(f"Modo: FIX remover órfãos legados Unico — {modo}")
+        r = fix_orfaos_unico(unico_pg, mercado, dry_run=args.dry_run)
+        _print_summary(r)
+        return
+
     if args.fix_chave_nfe_g3:
         _info("Modo: FIX chave_nfe G3 (reprocessa todas as datas G3)")
         r = fix_chave_nfe_g3(mercado)
+        _print_summary({"datas_reprocessadas": len(r["processed"]), "datas_falhou": len(r["failed"]), **({} if not r["failed"] else {"falhas": r["failed"]})})
+        return
+
+    if args.fix_entradas_g3:
+        modo = "DRY-RUN (nada persistido)" if args.dry_run else "APLICANDO"
+        _info(f"Modo: FIX reconciliar entradas G3 por documento — {modo}")
+        r = fix_entradas_g3(g3, dry_run=args.dry_run)
         _print_summary({"datas_reprocessadas": len(r["processed"]), "datas_falhou": len(r["failed"]), **({} if not r["failed"] else {"falhas": r["failed"]})})
         return
 

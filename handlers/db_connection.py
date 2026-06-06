@@ -250,3 +250,91 @@ class DatabaseConnection:
             raise
         finally:
             self.disconnect()
+
+    def reconcile_by_document(self, table_name: str, data: Union[pd.DataFrame, Dict],
+                              doc_columns: List[str], schema: str = 'public',
+                              batch_size: int = 500, dry_run: bool = False) -> dict:
+        """
+        Substitui atomicamente todas as linhas de cada documento presente em `data`:
+        DELETE das linhas cujas colunas `doc_columns` batem com as do extrato, seguido
+        de INSERT das linhas atuais — tudo numa única transação.
+
+        Usado para ENTRADAS, onde o id da linha (currenttimemillis = nep.id) é
+        REGENERADO a cada edição da nota no ERP. Um upsert por linha deixaria a linha
+        antiga órfã; ancorar no documento estável (ex.: tipodocumento + id_documento)
+        elimina o órfão porque o DELETE remove TODAS as linhas da nota antes de reinserir.
+
+        IMPORTANTE: linhas com qualquer `doc_column` NULL devem ser filtradas pelo
+        chamador (NULL não casa no DELETE e geraria duplicata). Destino PostgreSQL.
+
+        Se `dry_run=True`: executa DELETE+INSERT na transação, contabiliza o impacto
+        e dá ROLLBACK (não persiste nada). Retorna um dict com as contagens.
+        NUNCA usa TRUNCATE — o DELETE é sempre escopado às chaves de documento.
+        """
+        if isinstance(data, pd.DataFrame):
+            data = data.to_dict('records')
+        elif isinstance(data, dict):
+            data = [data]
+
+        if not data:
+            self.logger.warning("No data provided for reconcile_by_document")
+            return {"documentos": 0, "linhas_deletadas": 0, "linhas_inseridas": 0, "dry_run": dry_run}
+
+        if self.engine != 'postgres':
+            raise NotImplementedError("reconcile_by_document só suporta destino PostgreSQL")
+
+        columns = list(data[0].keys())
+        values = [tuple(record[col] for col in columns) for record in data]
+        # Chaves de documento distintas presentes no extrato
+        doc_keys = sorted({tuple(record[c] for c in doc_columns) for record in data})
+
+        cols_sql = ", ".join(doc_columns)
+        delete_q = (
+            f"DELETE FROM {schema}.{table_name} t "
+            f"USING (VALUES %s) AS v({cols_sql}) "
+            f"WHERE " + " AND ".join(f"t.{c} = v.{c}" for c in doc_columns)
+        )
+        insert_q = f"INSERT INTO {schema}.{table_name} ({', '.join(columns)}) VALUES %s"
+
+        deleted = 0
+        try:
+            self.connect()
+            with self.connection.cursor() as cursor:
+                # 1) Apaga as linhas dos documentos afetados (em lotes)
+                for i in range(0, len(doc_keys), batch_size):
+                    chunk = doc_keys[i:i + batch_size]
+                    execute_values(cursor, delete_q, chunk, page_size=batch_size)
+                    deleted += cursor.rowcount
+                # 2) Reinsere o estado atual de todas as linhas
+                total_batches = (len(values) + batch_size - 1) // batch_size
+                with tqdm(total=total_batches, desc="Reconciling (delete+insert)") as pbar:
+                    for i in range(0, len(values), batch_size):
+                        execute_values(cursor, insert_q, values[i:i + batch_size])
+                        pbar.update(1)
+
+            if dry_run:
+                self.connection.rollback()
+                self.logger.info(
+                    f"[DRY-RUN] reconcile_by_document: {len(doc_keys)} documentos, "
+                    f"{deleted} linhas seriam deletadas e {len(values)} reinseridas em "
+                    f"{schema}.{table_name} — ROLLBACK (nada persistido)."
+                )
+            else:
+                self.connection.commit()
+                self.logger.info(
+                    f"reconcile_by_document: {len(doc_keys)} documentos reconciliados, "
+                    f"{deleted} linhas deletadas, {len(values)} reinseridas em {schema}.{table_name}"
+                )
+            return {
+                "documentos": len(doc_keys),
+                "linhas_deletadas": deleted,
+                "linhas_inseridas": len(values),
+                "dry_run": dry_run,
+            }
+        except Exception as e:
+            self.logger.error(f"Error in reconcile_by_document operation: {e}")
+            if self.connection:
+                self.connection.rollback()
+            raise
+        finally:
+            self.disconnect()

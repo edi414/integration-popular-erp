@@ -168,9 +168,19 @@ class MovimentacaoEstoqueETL:
             self.logger.error(f"Erro na extração: {str(e)}")
             raise
 
-    def load_data(self, df: pd.DataFrame, date: str) -> None:
+    # tipodocumento de ENTRADA no G3 — a linha do produto (nep.id -> currenttimemillis)
+    # é regenerada a cada edição da nota, então essas linhas são reconciliadas por
+    # documento (tipodocumento + id_documento) em vez de upsert por linha.
+    ENTRADA_TIPODOCS = {55}
+
+    def load_data(self, df: pd.DataFrame, date: str, dry_run: bool = False) -> None:
         """
-        Load transformed data into target table using UPSERT
+        Load transformed data into target table.
+
+        ENTRADAS (tipodocumento em ENTRADA_TIPODOCS, com id_documento presente) são
+        reconciliadas por documento (DELETE+INSERT) para não deixar linha órfã quando
+        o ERP regenera o id da linha numa reedição. VENDAS e o restante seguem por
+        UPSERT na chave (tipodocumento, id_documento, currenttimemillis).
         """
         try:
             config = get_etl_config('movimentacao_estoque')
@@ -180,44 +190,67 @@ class MovimentacaoEstoqueETL:
                 'unique_columns',
                 ['datahora', 'codigo', 'documento', 'tipodocumento', 'tipo_movimentacao', 'currenttimemillis']
             )
-            
-            self.logger.info(f"Starting UPSERT for {len(df)} records on date {date}")
-            
-            self.target_connection.upsert(
-                table_name=table_name,
-                data=df,
-                unique_columns=unique_columns,
-                schema=schema
+
+            # Entradas com id_documento válido -> reconciliação por documento
+            is_entrada = df["tipodocumento"].isin(self.ENTRADA_TIPODOCS) & df["id_documento"].notna()
+            df_entradas = df[is_entrada]
+            df_resto = df[~is_entrada]
+
+            if not df_entradas.empty:
+                self.logger.info(
+                    f"{'[DRY-RUN] ' if dry_run else ''}Reconciliando por documento "
+                    f"{len(df_entradas)} linhas de ENTRADA na data {date}"
+                )
+                self.target_connection.reconcile_by_document(
+                    table_name=table_name,
+                    data=df_entradas,
+                    doc_columns=["tipodocumento", "id_documento"],
+                    schema=schema,
+                    dry_run=dry_run,
+                )
+
+            # No dry-run NÃO mexemos em vendas/resto (upsert persiste) — só validamos entradas.
+            if not df_resto.empty and not dry_run:
+                self.logger.info(f"Starting UPSERT for {len(df_resto)} records on date {date}")
+                self.target_connection.upsert(
+                    table_name=table_name,
+                    data=df_resto,
+                    unique_columns=unique_columns,
+                    schema=schema,
+                )
+
+            self.logger.info(
+                f"{'[DRY-RUN] ' if dry_run else ''}Load completed: {len(df_entradas)} entradas "
+                f"{'simuladas' if dry_run else 'reconciliadas'}, "
+                f"{len(df_resto)} registros {'IGNORADOS' if dry_run else 'via upsert'} para a data {date}"
             )
-            
-            self.logger.info(f"UPSERT completed: {len(df)} records processed for date {date}")
-            
+
         except Exception as e:
-            self.logger.error(f"Error during UPSERT for date {date}: {str(e)}")
+            self.logger.error(f"Error during load for date {date}: {str(e)}")
             raise
 
-    def _process_single_date(self, date: str) -> None:
+    def _process_single_date(self, date: str, dry_run: bool = False) -> None:
         """
         Process ETL for a single date (internal method)
         """
-        self.logger.info(f"Processing date: {date}")
-        
+        self.logger.info(f"Processing date: {date}{' [DRY-RUN]' if dry_run else ''}")
+
         # Extract
         raw_data = self.extract_data(date)
-        
+
         if raw_data.empty:
             self.logger.warning(f"No data found for date: {date}")
             return
-        
+
         self.logger.info(f"Extracted {len(raw_data)} records from source database")
-        
+
         # Transform
         transformed_data = self.transform_data(raw_data)
         self.logger.info(f"Transformed {len(transformed_data)} records")
-        
+
         # Load
-        self.load_data(transformed_data, date)
-        
+        self.load_data(transformed_data, date, dry_run=dry_run)
+
         self.logger.info(f"Successfully processed {len(transformed_data)} records for date: {date}")
 
     def run_etl(self) -> dict:
