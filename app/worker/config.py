@@ -24,6 +24,6 @@ class Config:
     MARIADB_DB = os.getenv("G3_DB", "gtech-gestao")
 
     # Webhook
-    WEBHOOK_URL = os.getenv("WEBHOOK_URL", "https://primary-production-aed3.up.railway.app/webhook/e4eee32b-4e62-471b-858b-65cd58484143")
+    WEBHOOK_URL = os.getenv("WEBHOOK_URL", "https://n8n.supermercadopopular.org/webhook-test/e4eee32b-4e62-471b-858b-65cd58484143")
 
 config = Config()
