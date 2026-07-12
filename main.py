@@ -7,6 +7,7 @@ from services.notas_fiscais import NotasFiscaisETL
 from services.catalogo import CatalogoETL
 from services.contas_a_pagar import ContasAPagarETL
 from services.movimentacao_estoque import MovimentacaoEstoqueETL
+from services.nfe_linkagem import NfeLinkagemETL
 from services.nfe_processor import NFeProcessorETL
 from services.produtos_similares import ProdutosSimilaresService
 from settings.db_config import G3_DATABASE, get_target_config
@@ -48,6 +49,11 @@ def run_movimentacao_estoque_etl():
     etl = MovimentacaoEstoqueETL(G3_DATABASE, get_target_config())
     return etl.run_etl()
 
+
+def run_nfe_linkagem_etl():
+    etl = NfeLinkagemETL(G3_DATABASE, get_target_config())
+    etl.run_etl()
+
 if __name__ == "__main__":
     app_logger.info("Iniciando Vendas Daily ETL...")
     v_summary = run_vendas_daily_etl()
@@ -81,5 +87,11 @@ if __name__ == "__main__":
     app_logger.info("Iniciando Movimentacao de Estoque ETL...")
     est_summary = run_movimentacao_estoque_etl()
     app_logger.info(f"   Processados: {est_summary['processed']}, Falhas: {est_summary['failed']}")
+
+    app_logger.info("Iniciando NFe Linkagem ETL (Itens de Notas de Entrada + Vinculo de Produto)...")
+    try:
+        run_nfe_linkagem_etl()
+    except Exception as e:
+        app_logger.warning(f"   [WARN] NFe Linkagem falhou: {e}")
 
     app_logger.info("Todos os processos ETL foram finalizados com sucesso.")

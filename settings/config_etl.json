@@ -58,5 +58,13 @@
         "table": "produtos",
         "query_file": "catalogo.sql",
         "logic_check_missing_dates": []
+    },
+
+    "nfe_linkagem": {
+        "database": "banco_mercado",
+        "schema": "public",
+        "table": "nfe_linkagem",
+        "query_file": "nfe_linkagem.sql",
+        "logic_check_missing_dates": []
     }
 }
