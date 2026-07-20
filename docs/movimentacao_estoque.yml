@@ -1,0 +1,283 @@
+table: movimentacao_estoque
+schema: public
+database: banco_mercado
+
+description: >
+  Registro histórico de toda movimentação de estoque: saídas (vendas PDV),
+  entradas (notas fiscais de compra) e cancelamentos.
+  Cobre dois períodos: legado até 31/03/2026 e sistema atual a partir de 01/04/2026.
+  Fonte primária para saldo de estoque, CMV, margem e análise fiscal.
+
+row_counts:
+  total_operacional: 3_174_924   # tipodocumento IN (1,2,3,55,65)
+  tipodoc_1_legado_venda: 2_697_585
+  tipodoc_2_legado_entrada: 134_010
+  tipodoc_3_legado_cte: 1_892
+  tipodoc_55_atual_entrada: 14_375
+  tipodoc_65_atual_venda: 327_062
+  ajustes_internos_negativos: 31_889   # excluir sempre
+
+# ─── DISCRIMINADOR PRINCIPAL ────────────────────────────────────────────────
+tipodocumento:
+  description: "Discrimina sistema de origem e tipo de documento. Peça central de todo filtro."
+  values:
+    1:  "Venda PDV — período legado (até 31/03/2026). tipo_movimentacao sempre 'S'."
+    2:  "Nota fiscal de entrada — período legado. tipo_movimentacao sempre 'E'."
+    3:  "CT-e / NF-e modelo 57 — período legado. tipo_movimentacao sempre 'E'."
+    55: "Nota fiscal de entrada — sistema atual (a partir 01/04/2026). tipo_movimentacao 'E' ou 'C'."
+    65: "Venda PDV — sistema atual (a partir 01/04/2026). tipo_movimentacao 'S' ou 'C'."
+    negativo: "Ajuste interno sem documento fiscal. Excluir de TODA análise operacional."
+  regra_base: "Sempre filtrar: tipodocumento IN (1, 2, 3, 55, 65)"
+
+# ─── TIPO DE MOVIMENTAÇÃO ───────────────────────────────────────────────────
+tipo_movimentacao:
+  values:
+    S:    "Saída — produto vendido. Reduz saldo."
+    E:    "Entrada — produto comprado. Aumenta saldo."
+    C:    "Cancelamento — não computar no saldo nem em análises."
+    NULL: "Ajuste interno (tipodocumento negativo). Excluir."
+  aviso: >
+    Tipodocumentos negativos podem ter tipo_movimentacao como NULL real
+    ou a string 'None' (artefato de ETL legado). Filtrar os dois:
+    WHERE tipo_movimentacao IN ('S', 'E', 'C')
+
+# ─── CHAVE ÚNICA ────────────────────────────────────────────────────────────
+unique_key:
+  columns: [tipodocumento, id_documento, currenttimemillis]
+  semantica: >
+    Identifica um item de um documento fiscal. Se o status de um documento
+    muda (ex: 'E' → 'C'), o UPSERT atualiza a linha — "último status vence".
+
+# ─── COLUNAS ────────────────────────────────────────────────────────────────
+columns:
+
+  datahora:
+    type: timestamp
+    description: "Data/hora da movimentação. Sem timezone — assume UTC-3 (Brasília)."
+
+  codigo:
+    type: varchar(50)
+    description: "SKU do produto. Chave para join com catalogo.produtos."
+
+  nome:
+    type: varchar
+    description: "Nome do produto no momento da movimentação (snapshot — pode divergir do catálogo atual)."
+
+  documento:
+    type: varchar(150)
+    nullable: true
+    description: "Identificador legível do documento fiscal. NULL em ajustes internos e ~50% dos CT-e."
+
+  id_documento:
+    type: bigint
+    nullable: true
+    aviso: >
+      NÃO é globalmente único. O mesmo número pode existir nos dois períodos
+      para documentos diferentes. Sempre restringir por tipodocumento ou período ao fazer joins.
+    join_seguro: |
+      ON v.id_documento = me.id_documento
+       AND ((v.emissao < '2026-04-01' AND me.tipodocumento IN (1,2,3))
+         OR (v.emissao >= '2026-04-01' AND me.tipodocumento IN (55,65)))
+
+  qtd:
+    type: numeric
+    description: "Quantidade movimentada. Sempre positiva — sentido definido por tipo_movimentacao."
+
+  valortotal:
+    type: numeric
+    description: "Valor total do item (qtd × preço unitário) em R$."
+
+  custoaquisicao:
+    type: numeric
+    description: "Custo unitário de aquisição. Para CMV: SUM(qtd * custoaquisicao) em saídas."
+
+  customedio:
+    type: numeric
+    description: "Custo médio ponderado do produto no momento da movimentação."
+
+  precoultimacompra:
+    type: numeric
+    description: "Snapshot do preço da última compra no momento da movimentação."
+
+  currenttimemillis:
+    type: bigint
+    description: "Identificador de linha dentro do documento. Parte da chave única."
+
+  chave_nfe:
+    type: varchar(44)
+    nullable: true
+    description: "Chave SEFAZ de 44 dígitos. Presente apenas em entradas com NF-e eletrônica."
+    join: "JOIN notas_fiscais nf ON nf.chave = me.chave_nfe AND me.tipo_movimentacao = 'E'"
+
+  icms:
+    type: numeric
+    nullable: true
+    description: "ICMS em R$ por item. Proporcional à quantidade movimentada."
+
+  icms_st:
+    type: numeric
+    nullable: true
+    description: "ICMS substituição tributária em R$ por item."
+
+  pis_cofins:
+    type: numeric
+    nullable: true
+    description: "PIS + COFINS somados em R$ por item."
+
+  ipi:
+    type: numeric
+    nullable: true
+
+  outros_impostos:
+    type: numeric
+    nullable: true
+
+  comissao:
+    type: numeric
+    nullable: true
+
+  cfop:
+    type: varchar(10)
+    description: "Código Fiscal de Operações. Ex: 5102=venda interna, 1102=compra interna."
+
+  saldo:
+    type: numeric
+    description: "SEMPRE NULL — calcular externamente (ver padrão saldo_estoque abaixo)."
+
+# ─── CANCELAMENTOS — REGRA CRÍTICA ─────────────────────────────────────────
+cancellation_rules:
+  resumo: >
+    Cancelamento nunca é apenas uma linha 'C'. O documento inteiro deve ser excluído.
+    Vendas do período legado não geram linha 'C' — o cancelamento fica em uniplus_vendas_pdvs.canc.
+
+  contagens:
+    atual_venda_docs_cancelados: 12_738    # documentos tipodoc=65 com linha 'C'
+    atual_docs_com_S_e_C: 11_068          # documentos com saída E cancelamento simultaneamente
+    atual_entrada_docs_cancelados: 42
+    legado_vendas_canc_com_mov_S: 8_074   # vendas canceladas que têm movimentação de saída
+
+  filtro_seguro_saidas: |
+    WHERE tipo_movimentacao = 'S'
+      AND tipodocumento IN (1, 2, 3, 55, 65)
+      -- Documentos do período atual com qualquer cancelamento
+      AND NOT (tipodocumento IN (55, 65) AND id_documento IN (
+          SELECT DISTINCT id_documento FROM movimentacao_estoque
+          WHERE tipodocumento IN (55, 65) AND tipo_movimentacao = 'C'
+            AND id_documento IS NOT NULL
+      ))
+      -- Vendas do período legado canceladas (não geram linha 'C' na tabela)
+      AND NOT (tipodocumento IN (1, 2, 3) AND id_documento IN (
+          SELECT id_documento FROM uniplus_vendas_pdvs
+          WHERE canc = true AND id_documento IS NOT NULL
+      ))
+
+  filtro_seguro_entradas: |
+    WHERE tipo_movimentacao = 'E'
+      AND tipodocumento IN (2, 3, 55)
+      AND NOT (tipodocumento = 55 AND id_documento IN (
+          SELECT DISTINCT id_documento FROM movimentacao_estoque
+          WHERE tipodocumento = 55 AND tipo_movimentacao = 'C'
+            AND id_documento IS NOT NULL
+      ))
+
+# ─── QUALIDADE DE DADOS ─────────────────────────────────────────────────────
+data_quality:
+
+  - issue: "2.334 vendas do período legado (canc=false) sem movimentação correspondente."
+    impacto: "Anti-join entre uniplus_vendas_pdvs e movimentacao_estoque retorna gaps reais — não é falha de ETL."
+
+  - issue: "8.074 vendas canceladas do período legado têm linha de saída 'S' sem linha 'C' correspondente."
+    impacto: "Obrigatório filtrar por canc=false em uniplus_vendas_pdvs ao analisar saídas do período legado."
+
+  - issue: "3 produtos com icms > valortotal: DUCREM (cód.220), DOCINHO CREMOSO (cód.347218), PACOCA EXTRA (cód.39308)."
+    impacto: "~196 linhas com ICMS desproporcional — produto vendido a preço próximo de zero (descarte/ajuste). Não é bug de ETL."
+
+  - issue: "Coluna saldo sempre NULL."
+    impacto: "Calcular externamente com CASE WHEN (ver padrão saldo_estoque abaixo)."
+
+  - issue: "Tipodocumentos negativos têm tipo_movimentacao como NULL ou a string literal 'None'."
+    impacto: "Filtrar sempre por tipo_movimentacao IN ('S','E','C') — não usar IS NOT NULL."
+
+# ─── PADRÕES DE USO (FEW-SHOT SQL) ─────────────────────────────────────────
+usage_patterns:
+
+  saldo_estoque: |
+    -- Saldo atual por produto (coluna saldo é NULL — calcular aqui)
+    SELECT codigo, nome,
+           SUM(CASE WHEN tipo_movimentacao = 'E' THEN qtd
+                    WHEN tipo_movimentacao = 'S' THEN -qtd
+                    ELSE 0 END) AS saldo_atual
+    FROM movimentacao_estoque
+    WHERE tipo_movimentacao IN ('E', 'S')
+      AND tipodocumento IN (1, 2, 3, 55, 65)
+    GROUP BY codigo, nome
+    ORDER BY codigo;
+
+  vendas_por_periodo: |
+    -- Vendas limpas num período: qtd, receita, CMV, margem
+    SELECT codigo, nome,
+           SUM(qtd)                   AS qtd,
+           SUM(valortotal)            AS receita,
+           SUM(qtd * custoaquisicao)  AS cmv,
+           ROUND(SUM(valortotal) - SUM(qtd * custoaquisicao), 2) AS margem
+    FROM movimentacao_estoque
+    WHERE tipo_movimentacao = 'S'
+      AND tipodocumento IN (1, 2, 3, 55, 65)
+      AND datahora BETWEEN :data_inicio AND :data_fim
+      AND NOT (tipodocumento IN (55, 65) AND id_documento IN (
+          SELECT DISTINCT id_documento FROM movimentacao_estoque
+          WHERE tipodocumento IN (55, 65) AND tipo_movimentacao = 'C'
+            AND id_documento IS NOT NULL
+      ))
+      AND NOT (tipodocumento IN (1, 2, 3) AND id_documento IN (
+          SELECT id_documento FROM uniplus_vendas_pdvs
+          WHERE canc = true AND id_documento IS NOT NULL
+      ))
+    GROUP BY codigo, nome ORDER BY receita DESC;
+
+  join_com_vendas: |
+    -- Join seguro com uniplus_vendas_pdvs (evita colisão de id entre períodos)
+    SELECT v.documento, v.emissao, me.codigo, me.nome, me.qtd, me.valortotal
+    FROM uniplus_vendas_pdvs v
+    JOIN movimentacao_estoque me
+      ON v.id_documento = me.id_documento
+     AND me.tipo_movimentacao = 'S'
+     AND ((v.emissao <  '2026-04-01' AND me.tipodocumento IN (1, 2, 3))
+       OR (v.emissao >= '2026-04-01' AND me.tipodocumento IN (55, 65)))
+    WHERE v.emissao BETWEEN :data_inicio AND :data_fim
+      AND v.canc = false;
+
+  cobertura_estoque_produto: |
+    -- Saldo / média de venda semanal das últimas 8 semanas para um produto
+    WITH vendas AS (
+      SELECT codigo, SUM(qtd) / 8.0 AS media_semanal
+      FROM movimentacao_estoque
+      WHERE tipo_movimentacao = 'S'
+        AND tipodocumento IN (1, 2, 3, 55, 65)
+        AND datahora >= DATE_TRUNC('week', CURRENT_DATE) - INTERVAL '8 weeks'
+        AND NOT (tipodocumento IN (55, 65) AND id_documento IN (
+            SELECT DISTINCT id_documento FROM movimentacao_estoque
+            WHERE tipodocumento IN (55, 65) AND tipo_movimentacao = 'C'
+              AND id_documento IS NOT NULL
+        ))
+        AND NOT (tipodocumento IN (1, 2, 3) AND id_documento IN (
+            SELECT id_documento FROM uniplus_vendas_pdvs
+            WHERE canc = true AND id_documento IS NOT NULL
+        ))
+      GROUP BY codigo
+    ),
+    saldo AS (
+      SELECT codigo,
+             SUM(CASE WHEN tipo_movimentacao = 'E' THEN qtd
+                      WHEN tipo_movimentacao = 'S' THEN -qtd
+                      ELSE 0 END) AS saldo_atual
+      FROM movimentacao_estoque
+      WHERE tipo_movimentacao IN ('E', 'S')
+        AND tipodocumento IN (1, 2, 3, 55, 65)
+      GROUP BY codigo
+    )
+    SELECT s.codigo, s.saldo_atual,
+           ROUND(v.media_semanal, 2)                            AS media_venda_semanal,
+           ROUND(s.saldo_atual / NULLIF(v.media_semanal, 0), 1) AS cobertura_semanas
+    FROM saldo s LEFT JOIN vendas v USING (codigo)
+    WHERE s.codigo = :codigo;
