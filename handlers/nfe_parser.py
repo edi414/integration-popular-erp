@@ -90,7 +90,6 @@ class NFeParser:
             prod = det.find('nfe:prod', self.NAMESPACE)
             
             item = {
-                'id': self._generate_random_id(),
                 'chave_nfe': chave,
                 'descricao': self._get_text(prod, 'nfe:xProd'),
                 'ean_trib': self._get_text(prod, 'nfe:cEANTrib'),
@@ -148,16 +147,6 @@ class NFeParser:
                 item['aliq_cofins'] = float(self._get_text(cofins_aliq, 'nfe:pCOFINS') or 0)
                 item['valor_cofins'] = float(self._get_text(cofins_aliq, 'nfe:vCOFINS') or 0)
 
-            item['preco_compra'] = item['valor_total'] + item.get('valor_ipi', 0) + item.get('v_icms_st', 0)
-            
-            if item['quantidade'] > 0:
-                item['preco_min'] = round((item['preco_compra'] * 1.15) / item['quantidade'], 2)
-            else:
-                item['preco_min'] = 0
-            
-            item['response'] = 'Ok' if item['sale_type'] == 'UN' else 'Atenção: revisar o preço mínimo calculado'
-            item['qtd_embalagem'] = None
-            
             items.append(item)
             
         return items
