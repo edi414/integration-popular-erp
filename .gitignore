@@ -200,4 +200,4 @@ cython_debug/
 CERTIFICADO MERCADO POPULAR.pfx
 certificado_supermercadopopular.pfx
 .claude
-docs/
+docs/logs/unico_backfill_checkpoint.txt

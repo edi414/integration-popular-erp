@@ -1,14 +1,33 @@
 WITH ult_notafiscalitem AS (
-    SELECT DISTINCT ON (idnotafiscal, produto)
-        *
+    SELECT
+        idnotafiscal,
+        produto,
+        SUM(icms)               AS icms,
+        SUM(icmssubstituicao)   AS icmssubstituicao,
+        SUM(ipi)                AS ipi,
+        SUM(pis)                AS pis,
+        SUM(cofins)             AS cofins,
+        SUM(outrosimpostospreco) AS outrosimpostospreco,
+        SUM(comissao)           AS comissao,
+        MAX(tributacao)         AS tributacao,
+        MAX(cfop)               AS cfop,
+        MAX(unidade)            AS unidade
     FROM public.notafiscalitem
-    ORDER BY idnotafiscal, produto, id DESC
+    GROUP BY idnotafiscal, produto
 ),
-ult_item AS (
-    SELECT DISTINCT ON (idoperacao, produto)
-        *
+agg_item AS (
+    SELECT
+        idoperacao,
+        produto,
+        SUM(icms)    / NULLIF(SUM(quantidade), 0) AS icms_por_unidade,
+        SUM(pis)     / NULLIF(SUM(quantidade), 0) AS pis_por_unidade,
+        SUM(cofins)  / NULLIF(SUM(quantidade), 0) AS cofins_por_unidade,
+        SUM(comissao)/ NULLIF(SUM(quantidade), 0) AS comissao_por_unidade,
+        MAX(ippt)          AS ippt,
+        MAX(cfop)          AS cfop,
+        MAX(unidademedida) AS unidademedida
     FROM public.item
-    ORDER BY idoperacao, produto, id DESC
+    GROUP BY idoperacao, produto
 )
 SELECT
     'Geral' AS local_estoque,
@@ -43,7 +62,7 @@ SELECT
     m.customedio,
     CASE
         WHEN m.tipodocumento::text IN ('2', '3') THEN n2.icms
-        WHEN m.tipodocumento::text IN ('1') THEN i.icms
+        WHEN m.tipodocumento::text IN ('1') THEN m.qtd * i.icms_por_unidade
         ELSE NULL
     END AS icms,
     CASE
@@ -58,7 +77,7 @@ SELECT
     END AS ippt,
     CASE
         WHEN m.tipodocumento::text IN ('2', '3') THEN (COALESCE(n2.pis, 0) + COALESCE(n2.cofins, 0))
-        WHEN m.tipodocumento::text IN ('1') THEN (COALESCE(i.pis, 0) + COALESCE(i.cofins, 0))
+        WHEN m.tipodocumento::text IN ('1') THEN m.qtd * (COALESCE(i.pis_por_unidade, 0) + COALESCE(i.cofins_por_unidade, 0))
         ELSE NULL
     END AS pis_cofins,
     CASE
@@ -73,7 +92,7 @@ SELECT
     END AS outros_impostos,
     CASE
         WHEN m.tipodocumento::text IN ('2', '3') THEN n2.comissao
-        WHEN m.tipodocumento::text IN ('1') THEN i.comissao
+        WHEN m.tipodocumento::text IN ('1') THEN m.qtd * i.comissao_por_unidade
         ELSE NULL
     END AS comissao,
     CASE
@@ -88,9 +107,12 @@ SELECT
     END AS un
 
 FROM (
-    -- Dedup: mesma chave natural pode ter duplicatas no Unico; mantém o id maior
     SELECT DISTINCT ON (currenttimemillis, idproduto, idoriginal, tipodocumento)
-        *
+        *,
+        CASE
+            WHEN quantidadeentrada IS NULL OR quantidadeentrada = 0 THEN quantidadesaida
+            ELSE quantidadeentrada
+        END AS qtd
     FROM public.movimentoestoque
     WHERE DATE(datahora) = %(data)s
       AND cancelado = 0
@@ -104,5 +126,5 @@ LEFT JOIN public.notafiscal n
     ON m.idoriginal = n.id
 LEFT JOIN ult_notafiscalitem n2
     ON m.idoriginal = n2.idnotafiscal AND p.codigo = n2.produto
-LEFT JOIN ult_item i
+LEFT JOIN agg_item i
     ON o.id = i.idoperacao AND p.codigo = i.produto;

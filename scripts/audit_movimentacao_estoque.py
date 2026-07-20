@@ -591,12 +591,21 @@ def _transform_unico(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def sync_unico(dates: list, unico_pg: DatabaseConnection, mercado: DatabaseConnection,
-               dry_run: bool = False) -> dict:
+               dry_run: bool = False, checkpoint_file: str = None) -> dict:
     modo = " [DRY-RUN — nada será persistido]" if dry_run else ""
     _section(f"Sync — Unico (dados históricos pré 01/04/2026){modo}")
     query = load_query_from_file("movimentacao_estoque_unico.sql")
     processed, failed = [], []
     tot_del = tot_ins = 0
+
+    done = set()
+    if checkpoint_file and Path(checkpoint_file).exists():
+        done = set(Path(checkpoint_file).read_text().splitlines())
+        if done:
+            _info(f"Checkpoint: {len(done)} datas já processadas — serão puladas.")
+
+    dates = [d for d in dates if d not in done]
+    _info(f"{len(dates)} datas restantes a processar.")
 
     for d in dates:
         try:
@@ -640,6 +649,9 @@ def sync_unico(dates: list, unico_pg: DatabaseConnection, mercado: DatabaseConne
             else:
                 _ok(f"  {len(df_entradas)} entradas reconciliadas + {len(df_resto)} via upsert para {d}.")
             processed.append(d)
+            if checkpoint_file and not dry_run:
+                with open(checkpoint_file, "a") as f:
+                    f.write(d + "\n")
         except Exception as e:
             logger.error(f"Erro ao processar {d} (Unico): {e}")
             _warn(f"  FALHOU: {e}")
@@ -767,9 +779,11 @@ def fix_orfaos_unico(unico_pg: DatabaseConnection, mercado: DatabaseConnection,
 
 
 def fix_id_documento_unico(unico_pg: DatabaseConnection, mercado: DatabaseConnection,
-                           dry_run: bool = False) -> dict:
+                           dry_run: bool = False, checkpoint_file: str = None) -> dict:
     """Reprocessa todas as datas Unico para reconciliar as ENTRADAS por documento
-    (m.idoriginal = operacao.id). Com dry_run=True nada é persistido."""
+    (m.idoriginal = operacao.id). Com dry_run=True nada é persistido.
+    Se checkpoint_file for informado, datas já concluídas são puladas e cada nova
+    data concluída é gravada no arquivo — permitindo parar e retomar sem perda."""
     _section("Fix — Reconciliar entradas Unico por documento (todas as datas)")
 
     q = """
@@ -785,7 +799,7 @@ def fix_id_documento_unico(unico_pg: DatabaseConnection, mercado: DatabaseConnec
 
     dates = df["data"].astype(str).tolist()
     _info(f"{len(dates)} datas Unico a reprocessar{' (DRY-RUN)' if dry_run else ''}.")
-    return sync_unico(dates, unico_pg, mercado, dry_run=dry_run)
+    return sync_unico(dates, unico_pg, mercado, dry_run=dry_run, checkpoint_file=checkpoint_file)
 
 
 # ---------------------------------------------------------------------------
@@ -872,6 +886,10 @@ def main() -> None:
                         help="Reprocessa só as datas Unico com entradas sem chave_nfe.")
     parser.add_argument("--fix-orfaos-unico", action="store_true", dest="fix_orfaos_unico",
                         help="Remove órfãos legados Unico (entradas cujo ctm sumiu da origem).")
+    parser.add_argument("--checkpoint-file", dest="checkpoint_file",
+                        default="logs/unico_backfill_checkpoint.txt",
+                        help="Arquivo de checkpoint para --fix-id-documento (parar e retomar). "
+                             "Padrão: logs/unico_backfill_checkpoint.txt")
     args = parser.parse_args()
 
     mercado = _mercado_conn()
@@ -881,7 +899,9 @@ def main() -> None:
     if args.fix_id_documento:
         modo = "DRY-RUN (nada persistido)" if args.dry_run else "APLICANDO"
         _info(f"Modo: FIX reconciliar entradas Unico por documento — {modo}")
-        r = fix_id_documento_unico(unico_pg, mercado, dry_run=args.dry_run)
+        _info(f"Checkpoint: {args.checkpoint_file}")
+        r = fix_id_documento_unico(unico_pg, mercado, dry_run=args.dry_run,
+                                   checkpoint_file=args.checkpoint_file)
         _print_summary({"datas_reprocessadas": len(r["processed"]), "datas_falhou": len(r["failed"]), **({} if not r["failed"] else {"falhas": r["failed"]})})
         return
 
