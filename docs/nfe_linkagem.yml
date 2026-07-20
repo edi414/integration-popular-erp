@@ -1,0 +1,187 @@
+table: nfe_linkagem
+schema: public
+database: banco_mercado
+
+description: >
+  Detalhe de itens das notas fiscais de entrada (sistema atual, a partir de 01/04/2026),
+  com vínculo ao produto do catálogo. Uma linha por item de nota.
+  Uso principal: diagnosticar itens não linkados ao catálogo e inspecionar
+  dados de produto diretamente do XML da NF-e (NCM, CFOP, unidade, valores).
+  Não confundir com movimentacao_estoque (movimentação de estoque)
+  nem notas_fiscais (cabeçalho fiscal para SEFAZ).
+
+row_counts:
+  total: 14_013
+  notas_distintas: 1_436       # chaves NF-e únicas
+  not_linkado_true: 52         # itens sem vínculo com catálogo (0.4%)
+  not_linkado_false: 13_961
+
+# ─── CHAVE DE RELACIONAMENTO ────────────────────────────────────────────────
+chave:
+  description: "Chave NF-e de 44 dígitos (ou identificador da nota). Nunca NULL nesta tabela."
+  join_notas_fiscais:  "JOIN notas_fiscais nf ON nf.chave = nl.chave"
+  join_movimentacao:   "JOIN movimentacao_estoque me ON me.chave_nfe = nl.chave AND me.tipo_movimentacao = 'E'"
+  aviso_join_movimentacao: >
+    O join com movimentacao_estoque é por chave da NOTA, não por item.
+    Se uma nota tem N itens em nfe_linkagem e M linhas em movimentacao_estoque,
+    o join produz N×M linhas — aplicar filtro adicional por codigo/id_produto.
+
+# ─── COLUNAS ────────────────────────────────────────────────────────────────
+columns:
+
+  chave:
+    type: varchar(255)
+    nullable: false
+    description: "Chave NF-e de 44 dígitos. Chave de join com notas_fiscais e movimentacao_estoque."
+
+  id_tipo_pagamento:
+    type: bigint
+    nullable: false
+    description: "Tipo de pagamento da nota de entrada."
+
+  descricao_produto_ne:
+    type: varchar(255)
+    nullable: false
+    description: "Descrição do produto conforme consta na nota fiscal do fornecedor."
+
+  ncm_produto_ne:
+    type: varchar(8)
+    nullable: false
+    description: "NCM (Nomenclatura Comum do Mercosul) do item conforme a nota."
+
+  cfop_produto_ne:
+    type: varchar(10)
+    nullable: false
+    description: "CFOP do item conforme a nota. Ex: 1102=compra interna para revenda."
+
+  unidade_produto_ne:
+    type: varchar(20)
+    nullable: false
+    description: "Unidade de medida do item conforme a nota (ex: UN, CX, KG)."
+
+  quantidade_produto_ne:
+    type: numeric(20,6)
+    nullable: false
+    description: "Quantidade do item conforme a nota."
+
+  valor_unitario_produto_ne:
+    type: numeric(20,6)
+    nullable: false
+    description: "Preço unitário do item conforme a nota."
+
+  valor_total_produto_ne:
+    type: numeric(20,6)
+    nullable: false
+    description: "Valor total do item (quantidade × valor unitário) conforme a nota."
+
+  valor_icms_produto_ne:
+    type: numeric(20,6)
+    nullable: false
+    description: "ICMS do item conforme a nota."
+
+  fator_multiplicativo_ne:
+    type: numeric(20,6)
+    nullable: false
+    description: "Fator de conversão de embalagem (ex: caixa com 12 unidades → fator=12)."
+
+  quantidade_total_produto_fatorado_ne:
+    type: numeric(20,6)
+    nullable: false
+    description: "Quantidade total em unidades base (quantidade_produto_ne × fator_multiplicativo_ne)."
+
+  valor_unitario_produto_fatorado_ne:
+    type: numeric(20,6)
+    nullable: false
+    description: "Preço unitário em unidades base (valor_unitario_produto_ne / fator_multiplicativo_ne)."
+
+  id_produto:
+    type: bigint
+    nullable: false
+    description: "ID do produto no sistema atual. Chave para join com catálogo."
+
+  not_linkado:
+    type: boolean
+    nullable: false
+    description: "true = item da nota sem vínculo resolvido a um produto do catálogo (0.4% dos itens)."
+
+  cfop_xml:
+    type: varchar(4)
+    nullable: false
+    description: "CFOP extraído diretamente do XML da NF-e (pode diferir do cfop_produto_ne do sistema)."
+
+  codigo_produto_cad:
+    type: varchar(60)
+    nullable: false
+    description: "Código do produto no catálogo interno. Chave para join com catalogo.produtos e movimentacao_estoque.codigo."
+
+  created_at:
+    type: timestamp
+    nullable: false
+    description: >
+      Data/hora da última reconciliação desta linha — NÃO é a data da nota fiscal.
+      Reflete quando o ETL rodou, não quando a nota foi emitida.
+      Para filtrar por data da nota, usar notas_fiscais.data_emissao via join.
+
+# ─── QUALIDADE DE DADOS ─────────────────────────────────────────────────────
+data_quality:
+
+  - issue: "52 itens (0.4%) com not_linkado=true."
+    impacto: >
+      Esses itens existem na nota fiscal mas não têm correspondência confirmada
+      no catálogo de produtos. Inspecionar descricao_produto_ne e ncm_produto_ne
+      para identificar o produto correto.
+    query: |
+      SELECT chave, descricao_produto_ne, ncm_produto_ne, cfop_xml,
+             quantidade_produto_ne, valor_total_produto_ne
+      FROM nfe_linkagem
+      WHERE not_linkado = true
+      ORDER BY chave;
+
+  - issue: "Uma nota pode ter múltiplas linhas do mesmo produto (ex: produto em dois lotes distintos na mesma NF-e)."
+    impacto: "Agregar por codigo_produto_cad ao somar quantidades/valores da mesma nota."
+
+  - issue: "created_at reflete data de processamento ETL, não data da nota."
+    impacto: "Não usar created_at para filtro temporal de negócio. Usar JOIN com notas_fiscais.data_emissao."
+
+# ─── PADRÕES DE USO (FEW-SHOT SQL) ─────────────────────────────────────────
+usage_patterns:
+
+  itens_nao_linkados: |
+    -- Itens de NF-e sem vínculo com catálogo — investigar fornecedor/SKU
+    SELECT nf.fornecedor, nf.data_emissao,
+           nl.descricao_produto_ne, nl.ncm_produto_ne, nl.cfop_xml,
+           nl.quantidade_produto_ne, nl.valor_total_produto_ne
+    FROM nfe_linkagem nl
+    JOIN notas_fiscais nf ON nf.chave = nl.chave
+    WHERE nl.not_linkado = true
+    ORDER BY nf.data_emissao DESC;
+
+  compras_por_produto_periodo: |
+    -- Compras de um produto via NF-e num período, com quantidade fatorada
+    SELECT nf.data_emissao, nf.fornecedor,
+           nl.descricao_produto_ne,
+           nl.quantidade_produto_ne,
+           nl.fator_multiplicativo_ne,
+           nl.quantidade_total_produto_fatorado_ne  AS qtd_unidades,
+           nl.valor_unitario_produto_fatorado_ne    AS preco_unit,
+           nl.valor_total_produto_ne
+    FROM nfe_linkagem nl
+    JOIN notas_fiscais nf ON nf.chave = nl.chave
+    WHERE nl.codigo_produto_cad = :codigo
+      AND nf.data_emissao BETWEEN :data_inicio AND :data_fim
+    ORDER BY nf.data_emissao DESC;
+
+  conciliar_nota_com_estoque: |
+    -- Itens da nota × movimentação de entrada (join por chave NF-e + codigo)
+    -- Atenção: filtrar por codigo para evitar produto cruzado
+    SELECT nl.descricao_produto_ne,
+           nl.quantidade_total_produto_fatorado_ne AS qtd_nota,
+           me.qtd                                  AS qtd_mov_estoque,
+           me.custoaquisicao,
+           me.icms
+    FROM nfe_linkagem nl
+    JOIN movimentacao_estoque me
+      ON me.chave_nfe = nl.chave
+     AND me.codigo    = nl.codigo_produto_cad
+     AND me.tipo_movimentacao = 'E'
+    WHERE nl.chave = :chave_nfe;
