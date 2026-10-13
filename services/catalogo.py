@@ -38,7 +38,7 @@ class CatalogoETL:
             # Integer columns that might have nulls
             int_columns = [
                 'balanca_integrada', 'id_grupo', 'id_regra_icms', 
-                'id_grupo_ipi', 'id_grupo_pis', 'id_grupo_cofins', 'ecf_icms_st'
+                'id_grupo_ipi', 'id_grupo_pis', 'id_grupo_cofins', 'ecf_icms_st', 'desativado'
             ]
             for col in int_columns:
                 if col in df.columns:
@@ -73,7 +73,7 @@ class CatalogoETL:
                 'preco_ultima_compra', 'preco_custo', 'fator_multiplicativo',
                 'cean_no_fornecedor', 'id_grupo', 'qtd_por_caixa', 'cest',
                 'id_regra_icms', 'id_grupo_ipi', 'id_grupo_pis', 'id_grupo_cofins',
-                'paf_p_st', 'ippt', 'iat', 'ecf_icms_st', 'imagem_url', 'embedding'
+                'paf_p_st', 'ippt', 'iat', 'ecf_icms_st', 'desativado', 'imagem_url', 'embedding'
             ]
             
             # Generate embeddings for the products

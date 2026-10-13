@@ -28,7 +28,9 @@ SELECT
     p.PAF_P_ST as paf_p_st,
     p.IPPT as ippt,
     p.IAT as iat,
-    p.ECF_ICMS_ST as ecf_icms_st
+    p.ECF_ICMS_ST as ecf_icms_st,
+    -- flag de produto desativado no Uniplus (EXCLUIDO continua filtrado abaixo)
+    p.DESATIVADO as desativado
 FROM produto p
 LEFT JOIN preco_produto_tipo_pagamento pptp
     ON pptp.id_produto = p.ID 
