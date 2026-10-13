@@ -29,7 +29,7 @@ SELECT
     p.IPPT as ippt,
     p.IAT as iat,
     p.ECF_ICMS_ST as ecf_icms_st,
-    -- flag de produto desativado no Uniplus (EXCLUIDO continua filtrado abaixo)
+    -- flag de produto desativado no G3 (EXCLUIDO continua filtrado abaixo)
     p.DESATIVADO as desativado
 FROM produto p
 LEFT JOIN preco_produto_tipo_pagamento pptp
