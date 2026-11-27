@@ -8,6 +8,7 @@ from traceback import format_exc
 from app.worker.config import config
 from app.worker.utils.logger import get_logger, log_event_to_file
 from app.worker.handlers.price_update_handler import handle_price_update
+from app.worker.handlers.gtin_update_handler import handle_gtin_update
 
 logger = get_logger()
 
@@ -34,6 +35,15 @@ class RedisConsumer:
             except redis.exceptions.ConnectionError as e:
                 logger.error(f"Não foi possível conectar ao Redis. Retentando em 5 segundos... Erro: {str(e)}")
                 time.sleep(5)
+
+    def _notify_webhook(self, payload: dict):
+        """Webhook de notificação após processamento."""
+        try:
+            logger.info(f"Enviando notificação para webhook: {config.WEBHOOK_URL}")
+            response = requests.post(config.WEBHOOK_URL, json=payload, timeout=10)
+            logger.info(f"Webhook enviado com sucesso. Status: {response.status_code}")
+        except Exception as e:
+            logger.error(f"Erro ao enviar webhook: {str(e)}")
 
     def start_consuming(self):
         """Bloqueia esperando eventos usando BRPOP."""
@@ -65,14 +75,10 @@ class RedisConsumer:
                         
                         if event_type == "update_price":
                             handle_price_update(event)
-                            
-                            # Webhook de notificação após processamento
-                            try:
-                                logger.info(f"Enviando notificação para webhook: {config.WEBHOOK_URL}")
-                                response = requests.post(config.WEBHOOK_URL, json=event, timeout=10)
-                                logger.info(f"Webhook enviado com sucesso. Status: {response.status_code}")
-                            except Exception as e:
-                                logger.error(f"Erro ao enviar webhook: {str(e)}")
+                            self._notify_webhook(event)
+                        elif event_type == "update_gtin":
+                            result = handle_gtin_update(event)
+                            self._notify_webhook({**event, **result})
                         else:
                             msg = f"Tipo de evento '{event_type}' desconhecido. Mensagem ignorada."
                             logger.warning(msg)

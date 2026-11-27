@@ -14,4 +14,15 @@ dependencies = [
     "lxml>=5.3.1",
     "cryptography>=44.0.2",
     "openai>=2.36.0",
+    "python-stdnum>=2.2",
+    "sentry-sdk>=3.0.1",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

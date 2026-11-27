@@ -22,6 +22,8 @@ class Config:
     MARIADB_USER = os.getenv("G3_USER", "root")
     MARIADB_PASSWORD = os.getenv("G3_PASSWORD", "")
     MARIADB_DB = os.getenv("G3_DB", "gtech-gestao")
+    # Usuário gravado em produto.ID_USUARIO_EDICAO nas trocas de GTIN (5 = EDIVALDO)
+    G3_ID_USUARIO_EDICAO = int(os.getenv("G3_ID_USUARIO_EDICAO", 5))
 
     # Webhook
     WEBHOOK_URL = os.getenv("WEBHOOK_URL", "https://n8n.supermercadopopular.org/webhook-test/e4eee32b-4e62-471b-858b-65cd58484143")
